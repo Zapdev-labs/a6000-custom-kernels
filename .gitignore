@@ -1,0 +1,30 @@
+# build products
+build/
+out/
+*.o
+*.a
+*.so
+*.dylib
+
+# archives + scratch (the .tgz files in the tree are packed copies of committed files)
+*.tgz
+*.tar.gz
+
+# benchmark / debug logs
+*.log
+moe_trace.bin
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# models
+*.gguf
+*.gguf.part
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/
+*.swp
