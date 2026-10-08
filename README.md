@@ -44,7 +44,7 @@ full sweep and methodology details are in [results/benchmark-results.md](results
 
 ## The three custom pieces
 
-### 1. `kernels/moe-cache.cu` — hot-expert cache + pointer-table MoE GEMV (853 lines)
+### 1. `kernels/moe-cache.cu` — hot-expert cache + pointer-table MoE GEMV (~870 lines)
 
 A fork of the `mul_mat_vec_q_moe` MMVQ kernel that sources each routed expert through a
 **device pointer table** instead of one base pointer:
@@ -88,10 +88,10 @@ F16, so stock llama.cpp **crashes on CUDA**. The kernel is templated on the weig
 ### 3. Scheduler patches (`patches/`)
 
 llama.cpp's scheduler won't send MoE GEMVs to a GPU that doesn't hold the weights, and
-refuses zero-copy reads of host buffers on discrete GPUs. Two patch scripts flip both:
-claim all `MUL_MAT_ID` batches for CUDA, and accept pinned `CUDA_Host` buffer types on
-discrete GPUs. A hook after `ggml_cuda_graph_evaluate_and_capture` runs the LRU promotion
-pass outside of CUDA-graph capture.
+refuses zero-copy reads of host buffers on discrete GPUs. `apply_patches.py` flips both
+in a single pass: claim all `MUL_MAT_ID` batches for CUDA, and accept pinned `CUDA_Host`
+buffer types on discrete GPUs. A hook after `ggml_cuda_graph_evaluate_and_capture` runs
+the LRU promotion pass outside of CUDA-graph capture.
 
 ## The `-lm none` requirement (the hard-won gotcha)
 
@@ -173,11 +173,10 @@ prefill target has no such floor, which is why `-ncmoe 4` reaches 301 t/s.
 ```
 kernels/            moe-cache.cu / .cuh  — hot-expert cache + pointer-table GEMV
                     ssm-conv.cu          — F16 conv-weight fix (prerequisite)
-patches/            apply_patches.py    — wire-in: include, MMVQ intercept, step hook, gate
-                    patch_final_state.py — claim all MUL_MAT_ID + accept CUDA_Host bufts
-                    patch_ple*.py       — PLE island experiment + exact revert (net loss)
-                    patch_revert.py, patch_buft.py — historical/superseded
+patches/            apply_patches.py    — full wire-in: includes, MMVQ intercept, offload
+                                          gate, CUDA_Host buft acceptance, step hook
                     patch_dbg.py        — scheduler copy-decision instrumentation (SCHEDDBG)
+                    experiments/patch_ple*.py — PLE island experiment + exact revert (net loss)
                     trace-hook/ggml-cpu.c — routing-trace hook for seed regeneration
 tools/make_seed.py  trace → frequency-ordered seed
 assets/moe_seed.txt measured seed for CYBER-FROST-3.8 (144 tensors)

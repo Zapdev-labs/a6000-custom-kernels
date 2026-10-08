@@ -1,14 +1,21 @@
 #!/usr/bin/env python3
 """Wire the hot-expert MoE cache into llama.cpp: mmvq.cu, ggml-cuda.cu.
 
+Applies the complete patch set in a single pass:
+  * moe-cache.cuh includes
+  * MMVQ intercept inside ggml_cuda_mul_mat_vec_q (host-resident experts go
+    through the device pointer table)
+  * offload gate claims ALL MUL_MAT_ID batches for CUDA
+  * supports_buft accepts pinned CUDA_Host buffers on discrete GPUs
+  * LRU promotion hook after CUDA graph capture
+
 Requires kernels/moe-cache.cu/.cuh to already be copied into
 <LLAMA_CPP_DIR>/ggml/src/ggml-cuda/. Anchors match llama.cpp commit 11fe0215.
-Set LLAMA_CPP_DIR (default /root/llama.cpp) to target another checkout.
+Set LLAMA_CPP_DIR (default ~/llama.cpp) to target another checkout.
 """
 import os
-import sys
 
-LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR", "/root/llama.cpp")
+LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR") or os.path.expanduser("~/llama.cpp")
 MMVQ = os.path.join(LLAMA_CPP_DIR, "ggml/src/ggml-cuda/mmvq.cu")
 CUDA = os.path.join(LLAMA_CPP_DIR, "ggml/src/ggml-cuda/ggml-cuda.cu")
 
@@ -55,7 +62,7 @@ patch(MMVQ,
     mul_mat_vec_q_switch_type(''')
 
 # ---------------------------------------------------------------------------
-# 2) ggml-cuda.cu: include + offload gate + step hook
+# 2) ggml-cuda.cu: include + offload gate + buft gate + step hook
 # ---------------------------------------------------------------------------
 patch(CUDA,
 '''#include "ggml-cuda/common.cuh"''',
@@ -71,14 +78,35 @@ patch(CUDA,
 '''static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    // Hot-expert cache: claim decode-sized MoE GEMVs (batch <= MMVQ_MAX_BATCH_SIZE) so
-    // they run on the GPU through the pointer-table kernel. Larger (prefill) batches stay
-    // on the CPU where batched GEMM over host RAM is faster than PCIe streaming.
+    // Hot-expert cache: claim all MoE GEMVs. Decode batches run through the
+    // pointer-table kernel (hot experts in VRAM, cold ones streamed from pinned host
+    // RAM over PCIe); prefill batches use the standard MMQ path, which reads the
+    // pinned host experts zero-copy over PCIe - both far faster than the CPU path.
     if (op->op == GGML_OP_MUL_MAT_ID && ggml_cuda_moe_cache_enabled()) {
-        return get_op_batch_size(op) <= MMVQ_MAX_BATCH_SIZE;
+        return true;
     }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+}''')
+
+patch(CUDA,
+'''static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+}''',
+'''static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+    const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
+
+    // Hot-expert cache: allow direct (zero-copy) reads of pinned CUDA_Host buffers on
+    // discrete GPUs. Without this the scheduler materializes full copies of host weights
+    // in VRAM for every op claimed by the CUDA backend.
+    if (ggml_cuda_moe_cache_enabled() && ggml_backend_buft_is_cuda_host(buft)) {
+        return true;
+    }
+
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
 }''')
 
 patch(CUDA,

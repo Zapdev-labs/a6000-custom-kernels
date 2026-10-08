@@ -9,7 +9,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
+# exported so the patch scripts below see the same target tree
+export LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
 COMMIT="11fe0215"   # upstream commit every patch anchor is written against
 CUDA_ARCH="${CUDA_ARCH:-86}"
 JOBS="${JOBS:-$(nproc)}"
@@ -29,9 +30,8 @@ git checkout --detach "$COMMIT"
 cp "$REPO_ROOT/kernels/moe-cache.cu" "$REPO_ROOT/kernels/moe-cache.cuh" "$REPO_ROOT/kernels/ssm-conv.cu" \
    ggml/src/ggml-cuda/
 
-# 3. apply the patches (base wire-in, then final-state flips)
+# 3. apply the patches (single pass, final state)
 python3 "$REPO_ROOT/patches/apply_patches.py"
-python3 "$REPO_ROOT/patches/patch_final_state.py"
 
 # 4. build (tests/examples off keeps the build to ~15 min on 60 cores)
 command -v nvcc >/dev/null 2>&1 || export PATH="/usr/local/cuda/bin:$PATH"

@@ -11,9 +11,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -31,8 +31,13 @@
 // pool between graph computes (never during CUDA graph capture).
 // ---------------------------------------------------------------------------
 
-#define MOE_MISS_CAP 8190
-#define MOE_MAX_PROMOTIONS 48
+// Device stats buffer layout: [0] = miss count, [1] = resident-hit count,
+// [2..2+MOE_MISS_CAP) = miss log of packed (tensor_id << 12 | expert) entries.
+static constexpr int MOE_MISS_CAP       = 8190;
+static constexpr int MOE_MAX_PROMOTIONS = 48;
+static constexpr int MOE_HIT_WORD       = 1;
+static constexpr int MOE_LOG_BASE       = 2;
+static constexpr int MOE_STATS_WORDS    = 2 + MOE_MISS_CAP;
 
 typedef float (*moe_vec_dot_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
 
@@ -75,8 +80,7 @@ static __global__ void moe_cache_gemv(
         const char * const * tbl_gate,        // [n_experts] gate weights, may be null
         uint32_t * stamps,                    // [n_experts] last-use clock (up tensor)
         uint32_t * stamps_gate,               // [n_experts] last-use clock (gate tensor)
-        uint32_t * miss,                      // [1 + MOE_MISS_CAP] packed (id<<12 | expert)
-        uint32_t * hits,                     // [1] resident-hit counter (debug/stats)
+        uint32_t * stats,                     // [MOE_STATS_WORDS] miss count/hits/miss log
         const uint32_t * d_clock,             // device copy of the global step counter
         int32_t cache_id,                     // registry id of the up tensor
         int32_t cache_id_gate,                // registry id of the gate tensor (-1 if none)
@@ -152,16 +156,24 @@ static __global__ void moe_cache_gemv(
         const char * p = tbl[channel_x];
         const bool is_host = ((uintptr_t) p) & 1u;
         vx = (const void *) (((uintptr_t) p) & ~(uintptr_t) 1u);
-        if (stamps) {
-            stamps[channel_x] = *d_clock;
-        }
-        if (is_host && blockIdx.x == 0 && miss) {
-            const uint32_t s = atomicAdd(miss, 1u);
-            if (s < MOE_MISS_CAP) {
-                miss[1 + s] = ((uint32_t) cache_id << 12) | channel_x;
+        // One lane per routing pick records the stats: the whole warp shares the
+        // same expert, and every blockIdx.x stripe works on the same pick, so
+        // writing per-thread would log each miss warp_size x nblocks_rows times
+        // (which would defeat the 2nd-sighting admission filter downstream).
+        if (blockIdx.x == 0 && threadIdx.x == 0) {
+            if (stamps) {
+                stamps[channel_x] = *d_clock;
             }
-        } else if (!is_host && blockIdx.x == 0 && hits) {
-            atomicAdd(hits, 1u);
+            if (stats) {
+                if (is_host) {
+                    const uint32_t s = atomicAdd(stats, 1u);
+                    if (s < MOE_MISS_CAP) {
+                        stats[MOE_LOG_BASE + s] = ((uint32_t) cache_id << 12) | channel_x;
+                    }
+                } else {
+                    atomicAdd(stats + MOE_HIT_WORD, 1u);
+                }
+            }
         }
         if constexpr (has_fusion) {
             if (use_gate) {
@@ -169,13 +181,19 @@ static __global__ void moe_cache_gemv(
                     const char * g = tbl_gate[channel_x];
                     const bool g_host = ((uintptr_t) g) & 1u;
                     vgate = (const void *) (((uintptr_t) g) & ~(uintptr_t) 1u);
-                    if (stamps_gate) {
-                        stamps_gate[channel_x] = *d_clock;
-                    }
-                    if (g_host && blockIdx.x == 0 && miss) {
-                        const uint32_t s = atomicAdd(miss, 1u);
-                        if (s < MOE_MISS_CAP) {
-                            miss[1 + s] = ((uint32_t) cache_id_gate << 12) | channel_x;
+                    if (blockIdx.x == 0 && threadIdx.x == 0) {
+                        if (stamps_gate) {
+                            stamps_gate[channel_x] = *d_clock;
+                        }
+                        if (stats) {
+                            if (g_host) {
+                                const uint32_t s = atomicAdd(stats, 1u);
+                                if (s < MOE_MISS_CAP) {
+                                    stats[MOE_LOG_BASE + s] = ((uint32_t) cache_id_gate << 12) | channel_x;
+                                }
+                            } else {
+                                atomicAdd(stats + MOE_HIT_WORD, 1u);
+                            }
                         }
                     }
                 } else {
@@ -284,11 +302,14 @@ struct moe_cache_entry {
     int n_experts = 0;
     int n_slots = 0;
     char * pool = nullptr;               // device, n_slots*expert_bytes
-    char ** d_tbl = nullptr;             // device, n_experts pointers
+    char ** d_tbl = nullptr;             // device, n_experts tagged pointers
+    std::vector<char *> h_tbl;           // host mirror of d_tbl (batched uploads)
     uint32_t * d_stamps = nullptr;       // device, n_experts
     std::vector<int32_t> slot_of;        // expert -> slot, -1 = cold
     std::vector<int32_t> expert_of;      // slot -> expert, -1 = free
     std::vector<uint32_t> h_stamps;      // host mirror of d_stamps for eviction
+    uint32_t stamps_clock = 0;           // g_h_clock when h_stamps was last refreshed
+    bool tbl_dirty = false;              // h_tbl changed since last upload to d_tbl
 };
 
 static bool g_moe_cache_enabled = false;
@@ -298,26 +319,40 @@ static size_t g_moe_cache_budget = 30ull << 30;     // total VRAM the pools may 
 static size_t g_moe_cache_used = 0;
 
 static std::mutex g_moe_mutex;
-static std::map<const char *, moe_cache_entry *> g_moe_by_data;
+static std::unordered_map<const char *, moe_cache_entry *> g_moe_by_data;
 static std::vector<moe_cache_entry *> g_moe_all;
-static uint32_t * g_d_miss = nullptr;      // device [1+MOE_MISS_CAP]
-static uint32_t * g_h_miss = nullptr;      // pinned host mirror
-static uint32_t * g_d_hits = nullptr;      // device [1]
+static uint32_t * g_d_stats = nullptr;     // device [MOE_STATS_WORDS]
+static uint32_t * g_h_stats = nullptr;     // pinned host mirror
 static uint32_t * g_d_clock = nullptr;     // device clock
 static uint32_t g_h_clock = 0;
-static std::map<uint32_t, int> g_admission; // (id<<12|expert) -> miss count for admission filter
+static std::unordered_map<uint32_t, int> g_admission; // (id<<12|expert) -> miss count
+
+static int moe_env_int(const char * name, int fallback) {
+    const char * s = getenv(name);
+    return s ? atoi(s) : fallback;
+}
+
+static double moe_env_double(const char * name, double fallback) {
+    const char * s = getenv(name);
+    return s ? atof(s) : fallback;
+}
+
+static bool moe_cache_debug() {
+    static const int debug = getenv("GGML_CUDA_MOE_CACHE_DEBUG") != nullptr;
+    return debug;
+}
 
 bool ggml_cuda_moe_cache_enabled() {
     if (!g_moe_cache_env_read) {
         const char * env = getenv("GGML_CUDA_MOE_CACHE");
         g_moe_cache_enabled = env && env[0] && env[0] != '0';
-        if (const char * s = getenv("GGML_CUDA_MOE_CACHE_SLOTS")) {
-            g_moe_cache_slots = atoi(s);
-            if (g_moe_cache_slots < 0) g_moe_cache_slots = 0;
+        g_moe_cache_slots = moe_env_int("GGML_CUDA_MOE_CACHE_SLOTS", g_moe_cache_slots);
+        if (g_moe_cache_slots < 0) {
+            g_moe_cache_slots = 0;
         }
-        if (const char * s = getenv("GGML_CUDA_MOE_CACHE_BUDGET_GB")) {
-            const double gb = atof(s);
-            if (gb > 0) g_moe_cache_budget = (size_t) (gb*1024.0*1024.0*1024.0);
+        const double gb = moe_env_double("GGML_CUDA_MOE_CACHE_BUDGET_GB", 0.0);
+        if (gb > 0) {
+            g_moe_cache_budget = (size_t) (gb*1024.0*1024.0*1024.0);
         }
         g_moe_cache_env_read = true;
         if (g_moe_cache_enabled) {
@@ -387,9 +422,11 @@ static bool moe_type_supported(ggml_type t) {
 
 // cached residency test: the expert tensor must live in host memory that the
 // GPU can read directly (cudaHostRegister'ed when GGML_CUDA_REGISTER_HOST=1).
-static std::map<const char *, bool> g_ptr_is_host;
+static std::unordered_map<const char *, bool> g_ptr_is_host;
+static std::mutex g_ptr_mutex;   // offload_op may be called from several threads
 
 static bool moe_ptr_is_host(const void * p) {
+    std::lock_guard<std::mutex> lock(g_ptr_mutex);
     auto it = g_ptr_is_host.find((const char *) p);
     if (it != g_ptr_is_host.end()) {
         return it->second;
@@ -407,7 +444,7 @@ bool ggml_cuda_moe_cache_wants(const ggml_tensor * src0) {
         return false;
     }
     if (!src0->buffer || !moe_ptr_is_host(src0->data)) {
-        if (getenv("GGML_CUDA_MOE_CACHE_DEBUG") && src0->ne[2] > 1) {
+        if (moe_cache_debug() && src0->ne[2] > 1) {
             cudaPointerAttributes attrs;
             cudaError_t err = cudaPointerGetAttributes(&attrs, const_cast<void *>(src0->data));
             fprintf(stderr, "moe-cache: wants? %s type=%s ne2=%lld ptr=%p nbytes=%zu view_src=%p bufname=%s err=%d attr=%d host=%d\n",
@@ -432,21 +469,19 @@ bool ggml_cuda_moe_cache_wants(const ggml_tensor * src0) {
 }
 
 static void moe_init_device_globals() {
-    if (g_d_miss) {
+    if (g_d_stats) {
         return;
     }
-    CUDA_CHECK(cudaMalloc(&g_d_miss, sizeof(uint32_t)*(1 + MOE_MISS_CAP)));
-    CUDA_CHECK(cudaMallocHost(&g_h_miss, sizeof(uint32_t)*(1 + MOE_MISS_CAP)));
-    CUDA_CHECK(cudaMemset(g_d_miss, 0, sizeof(uint32_t)*(1 + MOE_MISS_CAP)));
-    CUDA_CHECK(cudaMalloc(&g_d_hits, sizeof(uint32_t)));
-    CUDA_CHECK(cudaMemset(g_d_hits, 0, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&g_d_stats, sizeof(uint32_t)*MOE_STATS_WORDS));
+    CUDA_CHECK(cudaMallocHost(&g_h_stats, sizeof(uint32_t)*MOE_STATS_WORDS));
+    CUDA_CHECK(cudaMemset(g_d_stats, 0, sizeof(uint32_t)*MOE_STATS_WORDS));
     CUDA_CHECK(cudaMalloc(&g_d_clock, sizeof(uint32_t)));
     g_h_clock = 0;
     CUDA_CHECK(cudaMemset(g_d_clock, 0, sizeof(uint32_t)));
 }
 
 // seed file: lines of "tensorname id1,id2,..." (experts ordered by decode frequency)
-static std::map<std::string, std::vector<int>> g_seed;
+static std::unordered_map<std::string, std::vector<int>> g_seed;
 static bool g_seed_loaded = false;
 
 static void moe_load_seed() {
@@ -525,13 +560,12 @@ static moe_cache_entry * moe_get_or_create(const ggml_tensor * src0, cudaStream_
     }
     e->n_slots = slots;
 
-    std::vector<char *> h_tbl(e->n_experts);
+    e->h_tbl.resize(e->n_experts);
     for (int i = 0; i < e->n_experts; ++i) {
-        h_tbl[i] = (char *) (((uintptr_t) (e->data + (size_t) i*e->expert_bytes)) | (uintptr_t) 1);
+        e->h_tbl[i] = (char *) (((uintptr_t) (e->data + (size_t) i*e->expert_bytes)) | (uintptr_t) 1);
     }
 
     CUDA_CHECK(cudaMalloc(&e->d_tbl, sizeof(char *)*e->n_experts));
-    CUDA_CHECK(cudaMemcpy(e->d_tbl, h_tbl.data(), sizeof(char *)*e->n_experts, cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMalloc(&e->d_stamps, sizeof(uint32_t)*e->n_experts));
     CUDA_CHECK(cudaMemset(e->d_stamps, 0, sizeof(uint32_t)*e->n_experts));
     e->h_stamps.assign(e->n_experts, 0);
@@ -548,7 +582,8 @@ static moe_cache_entry * moe_get_or_create(const ggml_tensor * src0, cudaStream_
     g_moe_all.push_back(e);
 
     // seed the pool with the hottest experts from the routing trace (one-time H2D,
-    // issued on the compute stream so the first kernel launch is ordered after it)
+    // issued on the compute stream so the first kernel launch is ordered after it).
+    // All slots are free at registration, so seeded experts take slots 0..seeded-1.
     moe_load_seed();
     auto sit = g_seed.find(src0->name);
     if (sit != g_seed.end() && e->n_slots > 0) {
@@ -560,20 +595,10 @@ static moe_cache_entry * moe_get_or_create(const ggml_tensor * src0, cudaStream_
             if (expert < 0 || expert >= e->n_experts || e->slot_of[expert] >= 0) {
                 continue;
             }
-            int slot = -1;
-            for (int s = 0; s < e->n_slots; ++s) {
-                if (e->expert_of[s] < 0) {
-                    slot = s;
-                    break;
-                }
-            }
-            if (slot < 0) {
-                break;
-            }
+            const int slot = seeded;
             CUDA_CHECK(cudaMemcpyAsync(e->pool + (size_t) slot*e->expert_bytes,
                         e->data + (size_t) expert*e->expert_bytes, e->expert_bytes, cudaMemcpyHostToDevice, stream));
-            char * dev_entry = e->pool + (size_t) slot*e->expert_bytes;
-            CUDA_CHECK(cudaMemcpyAsync(e->d_tbl + expert, &dev_entry, sizeof(char *), cudaMemcpyHostToDevice, stream));
+            e->h_tbl[expert] = e->pool + (size_t) slot*e->expert_bytes;
             e->slot_of[expert] = slot;
             e->expert_of[slot] = expert;
             seeded += 1;
@@ -582,6 +607,10 @@ static moe_cache_entry * moe_get_or_create(const ggml_tensor * src0, cudaStream_
             fprintf(stderr, "moe-cache: seeded %d/%d experts for %s\n", seeded, e->n_slots, src0->name);
         }
     }
+
+    // one table upload covers the initial host entries and any seeded slots;
+    // on the same stream it lands after the pool copies above
+    CUDA_CHECK(cudaMemcpyAsync(e->d_tbl, e->h_tbl.data(), sizeof(char *)*e->n_experts, cudaMemcpyHostToDevice, stream));
 
     fprintf(stderr, "moe-cache: registered %s type=%s experts=%d slot_bytes=%zu slots=%d (pool %.1f MB, total %.2f GB, free VRAM %.2f GB)\n",
             src0->name[0] ? src0->name : "<tensor>", ggml_type_name(src0->type), e->n_experts, e->expert_bytes,
@@ -605,9 +634,14 @@ static int moe_acquire_slot(moe_cache_entry * e, cudaStream_t stream) {
             return s;
         }
     }
-    // evict the least recently used resident expert
-    CUDA_CHECK(cudaMemcpyAsync(e->h_stamps.data(), e->d_stamps, sizeof(uint32_t)*e->n_experts, cudaMemcpyDeviceToHost, stream));
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // pool is full: evict the least recently used resident expert. The stamp
+    // mirror is refreshed at most once per tensor per step instead of syncing
+    // the stream on every eviction.
+    if (e->stamps_clock != g_h_clock) {
+        CUDA_CHECK(cudaMemcpyAsync(e->h_stamps.data(), e->d_stamps, sizeof(uint32_t)*e->n_experts, cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        e->stamps_clock = g_h_clock;
+    }
     int victim_slot = -1;
     uint32_t best = UINT32_MAX;
     for (int s = 0; s < e->n_slots; ++s) {
@@ -624,9 +658,9 @@ static int moe_acquire_slot(moe_cache_entry * e, cudaStream_t stream) {
     const int victim = e->expert_of[victim_slot];
     if (victim >= 0) {
         e->slot_of[victim] = -1;
-        // point the evicted expert back at host RAM
-        char * host_entry = (char *) (((uintptr_t) (e->data + (size_t) victim*e->expert_bytes)) | (uintptr_t) 1);
-        CUDA_CHECK(cudaMemcpyAsync(e->d_tbl + victim, &host_entry, sizeof(char *), cudaMemcpyHostToDevice, stream));
+        // point the evicted expert back at host RAM (uploaded with the batch flush)
+        e->h_tbl[victim] = (char *) (((uintptr_t) (e->data + (size_t) victim*e->expert_bytes)) | (uintptr_t) 1);
+        e->tbl_dirty = true;
     }
     e->expert_of[victim_slot] = -1;
     return victim_slot;
@@ -639,17 +673,20 @@ void ggml_cuda_moe_cache_step(cudaStream_t stream) {
 
     std::lock_guard<std::mutex> lock(g_moe_mutex);
 
-    // pull the miss log
-    CUDA_CHECK(cudaMemcpyAsync(g_h_miss, g_d_miss, sizeof(uint32_t)*(1 + MOE_MISS_CAP), cudaMemcpyDeviceToHost, stream));
+    // pull the miss log and hit counter in a single copy
+    CUDA_CHECK(cudaMemcpyAsync(g_h_stats, g_d_stats, sizeof(uint32_t)*MOE_STATS_WORDS, cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
 
-    uint32_t n = g_h_miss[0];
+    uint32_t n = g_h_stats[0];
     if (n > MOE_MISS_CAP) {
         n = MOE_MISS_CAP;
     }
+    const uint32_t step_hits = g_h_stats[MOE_HIT_WORD];
 
+    // advance the LRU clock and reset both counters for the next step
     g_h_clock += 1;
     CUDA_CHECK(cudaMemcpyAsync(g_d_clock, &g_h_clock, sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
+    CUDA_CHECK(cudaMemsetAsync(g_d_stats, 0, 2*sizeof(uint32_t), stream));
 
     static uint32_t stats_calls = 0;
     static uint64_t stats_misses = 0;
@@ -657,13 +694,6 @@ void ggml_cuda_moe_cache_step(cudaStream_t stream) {
     static uint64_t stats_hits = 0;
     stats_calls += 1;
     stats_misses += n;
-
-    uint32_t step_hits = 0;
-    if (g_d_hits) {
-        CUDA_CHECK(cudaMemcpyAsync(&step_hits, g_d_hits, sizeof(uint32_t), cudaMemcpyDeviceToHost, stream));
-        CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaMemsetAsync(g_d_hits, 0, sizeof(uint32_t), stream));
-    }
     stats_hits += step_hits;
 
     if (stats_calls % 64 == 0) {
@@ -685,7 +715,7 @@ void ggml_cuda_moe_cache_step(cudaStream_t stream) {
     // admission filter: promote on the 2nd sighting, keeps one-off experts out
     int promoted = 0;
     for (uint32_t i = 0; i < n && promoted < MOE_MAX_PROMOTIONS; ++i) {
-        const uint32_t packed = g_h_miss[1 + i];
+        const uint32_t packed = g_h_stats[MOE_LOG_BASE + i];
         const int32_t cid = (int32_t) (packed >> 12);
         const int32_t expert = (int32_t) (packed & 0xFFF);
 
@@ -712,13 +742,24 @@ void ggml_cuda_moe_cache_step(cudaStream_t stream) {
         CUDA_CHECK(cudaMemcpyAsync(e->pool + (size_t) slot*e->expert_bytes,
                     e->data + (size_t) expert*e->expert_bytes, e->expert_bytes, cudaMemcpyHostToDevice, stream));
 
-        char * dev_entry = e->pool + (size_t) slot*e->expert_bytes;
-        CUDA_CHECK(cudaMemcpyAsync(e->d_tbl + expert, &dev_entry, sizeof(char *), cudaMemcpyHostToDevice, stream));
+        // table updates are staged in the host mirror and flushed once below,
+        // ordered after the pool copies so no kernel sees a stale slot
+        e->h_tbl[expert] = e->pool + (size_t) slot*e->expert_bytes;
+        e->tbl_dirty = true;
 
         e->slot_of[expert] = slot;
         e->expert_of[slot] = expert;
         promoted += 1;
         stats_promos += 1;
+    }
+
+    // flush pointer-table updates: one upload per touched tensor per step
+    for (moe_cache_entry * e : g_moe_all) {
+        if (!e->tbl_dirty) {
+            continue;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(e->d_tbl, e->h_tbl.data(), sizeof(char *)*e->n_experts, cudaMemcpyHostToDevice, stream));
+        e->tbl_dirty = false;
     }
 
     // keep the admission filter from growing without bound
@@ -731,10 +772,6 @@ void ggml_cuda_moe_cache_step(cudaStream_t stream) {
             }
         }
     }
-
-    // reset the miss counter for the next step
-    uint32_t zero = 0;
-    CUDA_CHECK(cudaMemcpyAsync(g_d_miss, &zero, sizeof(uint32_t), cudaMemcpyHostToDevice, stream));
 }
 
 // ---------------------------------------------------------------------------
@@ -765,7 +802,7 @@ static void moe_cache_gemv_launch(
     if (has_fusion) {
         ggml_cuda_kernel_launch((moe_cache_gemv<type, rows_per_block, true>), launch_params,
                 e->d_tbl, ge ? ge->d_tbl : nullptr, e->d_stamps, ge ? ge->d_stamps : nullptr,
-                g_d_miss, g_d_hits, g_d_clock, e->id, ge ? ge->id : -1,
+                g_d_stats, g_d_clock, e->id, ge ? ge->id : -1,
                 src1_q8_1, ids_d, fusion, dst_d, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -773,7 +810,7 @@ static void moe_cache_gemv_launch(
     } else {
         ggml_cuda_kernel_launch((moe_cache_gemv<type, rows_per_block, false>), launch_params,
                 e->d_tbl, nullptr, e->d_stamps, nullptr,
-                g_d_miss, g_d_hits, g_d_clock, e->id, -1,
+                g_d_stats, g_d_clock, e->id, -1,
                 src1_q8_1, ids_d, fusion, dst_d, ncols_x, nchannels_y_fd, nrows_x,
                 stride_row_x, stride_col_y, stride_col_dst,
                 stride_channel_x, stride_channel_y, stride_channel_dst,
@@ -806,48 +843,26 @@ void ggml_cuda_moe_cache_mul_mat_vec_q(
         ge = moe_get_or_create(fusion->gate, stream);
     }
 
+#define MOE_CACHE_LAUNCH(TYPE) \
+        case TYPE: \
+            moe_cache_gemv_launch<TYPE>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d, \
+                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, \
+                stride_channel_y, stride_channel_dst, nchannels_y, nchannels_dst, \
+                ids_stride, warp_size, stream); \
+            break;
+
     switch (src0->type) {
-        case GGML_TYPE_Q2_K:
-            moe_cache_gemv_launch<GGML_TYPE_Q2_K>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q3_K:
-            moe_cache_gemv_launch<GGML_TYPE_Q3_K>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q4_K:
-            moe_cache_gemv_launch<GGML_TYPE_Q4_K>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q5_K:
-            moe_cache_gemv_launch<GGML_TYPE_Q5_K>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q6_K:
-            moe_cache_gemv_launch<GGML_TYPE_Q6_K>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q4_0:
-            moe_cache_gemv_launch<GGML_TYPE_Q4_0>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q5_0:
-            moe_cache_gemv_launch<GGML_TYPE_Q5_0>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
-        case GGML_TYPE_Q8_0:
-            moe_cache_gemv_launch<GGML_TYPE_Q8_0>(e, ge, src1_q8_1, ids_d, fusion_dev, dst_d,
-                ne00, ne01, ncols_dst, s01, stride_col_y, stride_col_dst, s02, stride_channel_y, stride_channel_dst,
-                nchannels_y, nchannels_dst, ids_stride, warp_size, stream);
-            break;
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q2_K)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q3_K)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q4_K)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q5_K)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q6_K)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q4_0)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q5_0)
+        MOE_CACHE_LAUNCH(GGML_TYPE_Q8_0)
         default:
             GGML_ABORT("moe-cache: unsupported expert type %s", ggml_type_name(src0->type));
     }
+
+#undef MOE_CACHE_LAUNCH
 }
