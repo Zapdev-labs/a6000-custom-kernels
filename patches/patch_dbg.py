@@ -2,12 +2,12 @@
 """Debug: print why split-input copies are created for expert weights.
 
 Enable at runtime with GGML_SCHED_DEBUG=1 (and optionally GGML_CUDA_MOE_CACHE_DEBUG=1).
-Set LLAMA_CPP_DIR (default /root/llama.cpp) to target another checkout.
+Set LLAMA_CPP_DIR (default ~/llama.cpp) to target another checkout.
 """
 import os
 import sys
 
-LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR", "/root/llama.cpp")
+LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR") or os.path.expanduser("~/llama.cpp")
 BB = os.path.join(LLAMA_CPP_DIR, "ggml/src/ggml-backend.cpp")
 
 def patch(path, old, new, count=1):

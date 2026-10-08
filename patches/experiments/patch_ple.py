@@ -7,11 +7,11 @@
 Result at 262144 ctx: pp512 92.3 / tg128 45.2 vs 102.7 / 48.2 without it.
 Revert with patch_ple_revert.py.
 
-Set LLAMA_CPP_DIR (default /root/llama.cpp) to target another checkout.
+Set LLAMA_CPP_DIR (default ~/llama.cpp) to target another checkout.
 """
 import os
 
-LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR", "/root/llama.cpp")
+LLAMA_CPP_DIR = os.environ.get("LLAMA_CPP_DIR") or os.path.expanduser("~/llama.cpp")
 CUDA = os.path.join(LLAMA_CPP_DIR, "ggml/src/ggml-cuda/ggml-cuda.cu")
 
 def patch(path, old, new, count=1):

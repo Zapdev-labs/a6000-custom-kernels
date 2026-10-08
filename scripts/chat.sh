@@ -11,9 +11,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N_CMOE="${N_CMOE:-8}"
 CTX="${CTX:-262144}"
 
-export GGML_CUDA_MOE_CACHE=1
-export GGML_CUDA_MOE_CACHE_SLOTS=320
-export GGML_CUDA_MOE_CACHE_SEED="${SEED:-$REPO_ROOT/assets/moe_seed.txt}"
+. "$REPO_ROOT/scripts/moe-env.sh"
 
 # -lm none is REQUIRED (see scripts/bench.sh / README).
 exec "$LLAMA_CPP_DIR/build/bin/llama-cli" \

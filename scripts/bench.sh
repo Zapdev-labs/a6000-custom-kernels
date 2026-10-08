@@ -8,6 +8,7 @@
 #   N_CMOE  host-side expert layers (default 8, best joint operating point;
 #           4 favors prefill ~300 t/s at ~42 decode, 18 is the conservative end)
 #   CTX     context size (default 262144)
+#   SEED    seed file override; MOE_CACHE_SLOTS overrides the pool size
 set -euo pipefail
 
 LLAMA_CPP_DIR="${LLAMA_CPP_DIR:-$HOME/llama.cpp}"
@@ -16,9 +17,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 N_CMOE="${N_CMOE:-8}"
 CTX="${CTX:-262144}"
 
-export GGML_CUDA_MOE_CACHE=1
-export GGML_CUDA_MOE_CACHE_SLOTS=320
-export GGML_CUDA_MOE_CACHE_SEED="${SEED:-$REPO_ROOT/assets/moe_seed.txt}"
+. "$REPO_ROOT/scripts/moe-env.sh"
 
 # -lm none is REQUIRED: mmap (-lm auto) gives expert tensors plain CPU_Mapped
 # buffers instead of pinned CUDA_Host buffers, which breaks zero-copy GPU reads
